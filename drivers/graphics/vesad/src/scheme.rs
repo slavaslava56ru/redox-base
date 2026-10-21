@@ -141,7 +141,7 @@ impl GraphicsAdapter for FbAdapter {
                 let onscreen_ptr = framebuffer.onscreen as *mut u32; // FIXME use as_mut_ptr once stable
                 for row in 0..framebuffer.height {
                     unsafe {
-                        ptr::write_bytes(
+                        fill_device_pixels(
                             onscreen_ptr.add(row * framebuffer.stride),
                             0,
                             framebuffer.width,
@@ -276,12 +276,31 @@ impl GraphicScreen {
 
         for row in start_y..start_y + h {
             unsafe {
-                ptr::copy(
+                copy_to_device_pixels(
                     offscreen_ptr.add(row * self.width + start_x),
                     onscreen_ptr.add(row * framebuffer.stride + start_x),
                     w,
                 );
             }
         }
+    }
+}
+
+// The framebuffer is device memory. Plain ptr::copy/write_bytes become memmove/memset, which use
+// SSE stores; hypervisors that trap and emulate framebuffer writes (e.g. QEMU's WHPX backend while
+// tracking dirty VGA memory) cannot decode those and kill the VM. Volatile 32-bit stores stay plain
+// `mov`s that every emulator handles, and write-combining still merges them on real hardware.
+
+/// Copies `count` pixels from ordinary memory to the framebuffer.
+unsafe fn copy_to_device_pixels(src: *const u32, dst: *mut u32, count: usize) {
+    for i in 0..count {
+        unsafe { dst.add(i).write_volatile(src.add(i).read()) };
+    }
+}
+
+/// Sets `count` framebuffer pixels to `value`.
+unsafe fn fill_device_pixels(dst: *mut u32, value: u32, count: usize) {
+    for i in 0..count {
+        unsafe { dst.add(i).write_volatile(value) };
     }
 }
