@@ -3,7 +3,7 @@ use std::str;
 use libredox::flag;
 use scheme_utils::FpathWriter;
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State};
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::time::Duration;
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 use syscall::{self, Error as SyscallError, Result as SyscallResult};
@@ -453,14 +453,7 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
             Ok(i32::from_ne_bytes(bytes.try_into().unwrap()))
         };
 
-        // smoltcp arms the keep-alive timer as soon as it is enabled, so on a connection that is
-        // still handshaking (e.g. curl sets SO_KEEPALIVE right after a non-blocking connect) it
-        // would send a keep-alive probe instead of completing the handshake. Until such options
-        // can be remembered and applied once established, ignore them before that point.
-        let established = matches!(self.state(), State::Established | State::CloseWait);
-
         match (level, name) {
-            (SOL_SOCKET | IPPROTO_TCP, SO_KEEPALIVE | TCP_KEEPIDLE) if !established => {}
             (SOL_SOCKET, SO_KEEPALIVE) => {
                 let keep_alive = if int_value()? != 0 {
                     Some(self.keep_alive().unwrap_or(DEFAULT_KEEPIDLE))

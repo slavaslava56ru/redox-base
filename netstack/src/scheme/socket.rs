@@ -42,7 +42,13 @@ pub struct NullFile {
     pub gid: u32,
     pub read_enabled: bool,
     pub write_enabled: bool,
+    /// setsockopt calls made before bind/connect, as (level, name, value); applied once the
+    /// socket exists.
+    pub pending_opts: Vec<(usize, usize, Vec<u8>)>,
 }
+
+/// Bound on remembered pre-connect options, so a misbehaving client can't grow it unboundedly.
+const MAX_PENDING_OPTS: usize = 32;
 
 pub struct SocketFile<DataT> {
     pub flags: usize,
@@ -288,6 +294,7 @@ where
     pub socket_set: Rc<RefCell<SocketSet>>,
     pub scheme_file: Socket,
     scheme_data: SocketT::SchemeDataT,
+    scheme_name: String,
     _phantom_socket: PhantomData<SocketT>,
 }
 
@@ -308,6 +315,7 @@ where
             socket_set,
             scheme_data: SocketT::new_scheme_data(),
             scheme_file,
+            scheme_name: name.to_owned(),
             _phantom_socket: PhantomData,
             context: Context { iface, route_table },
         };
@@ -474,8 +482,16 @@ where
                         let socket = socket_set.get_mut::<SocketT>(file.socket_handle());
                         SocketT::set_sock_opt(socket, file, level, name, payload)
                     }
-                    // TODO: remember options (e.g. SO_REUSEADDR) set before bind/connect
-                    Handle::Null(_) => Ok(0),
+                    // Not bound/connected yet: remember the option and apply it when the socket
+                    // is created (see open_inner). Clients commonly set TCP_NODELAY and
+                    // keep-alive this way, right before a non-blocking connect.
+                    Handle::Null(null) => {
+                        if null.pending_opts.len() >= MAX_PENDING_OPTS {
+                            return Err(SyscallError::new(syscall::ENOMEM));
+                        }
+                        null.pending_opts.push((level, name, payload.to_vec()));
+                        Ok(0)
+                    }
                     Handle::SchemeRoot => Err(SyscallError::new(syscall::EBADF)),
                 }
             }
@@ -578,6 +594,7 @@ where
         gid: u32,
         read_enabled: bool,
         write_enabled: bool,
+        pending_opts: Vec<(usize, usize, Vec<u8>)>,
     ) -> SyscallResult<OpenResult> {
         if path.is_empty() {
             let null = NullFile {
@@ -586,6 +603,7 @@ where
                 gid,
                 read_enabled,
                 write_enabled,
+                pending_opts,
             };
 
             let id = self.handles.insert(Handle::Null(null));
@@ -603,7 +621,7 @@ where
                 &self.context,
             )?;
 
-            let file = SchemeFile::Socket(SocketFile {
+            let mut file = SchemeFile::Socket(SocketFile {
                 flags,
                 events: 0,
                 socket_handle,
@@ -615,6 +633,17 @@ where
                 write_enabled: write_enabled,
                 data,
             });
+
+            if !pending_opts.is_empty() {
+                let mut socket_set = self.socket_set.borrow_mut();
+                let socket = socket_set.get_mut::<SocketT>(socket_handle);
+                for (level, name, value) in &pending_opts {
+                    // The caller already got success for these; a failure now can only be logged.
+                    if let Err(err) = SocketT::set_sock_opt(socket, &mut file, *level, *name, value) {
+                        warn!("deferred setsockopt({level}, {name}) failed: {err}");
+                    }
+                }
+            }
 
             self.ref_counts.insert(socket_handle, 1);
             let id = self.handles.insert(Handle::File(file));
@@ -644,7 +673,9 @@ where
         ctx: &CallerCtx,
     ) -> SyscallResult<OpenResult> {
         match self.handles.get(fd)? {
-            Handle::SchemeRoot => self.open_inner(path, flags, ctx.uid, ctx.gid, true, true),
+            Handle::SchemeRoot => {
+                self.open_inner(path, flags, ctx.uid, ctx.gid, true, true, Vec::new())
+            }
             _ => Err(SyscallError::new(syscall::EACCES)),
         }
     }
@@ -792,8 +823,17 @@ where
                         null.read_enabled,
                         null.write_enabled,
                     );
+                    let pending_opts = null.pending_opts.clone();
                     // dup from empty path to a new path
-                    return self.open_inner(path, flags, uid, gid, read_enabled, write_enabled);
+                    return self.open_inner(
+                        path,
+                        flags,
+                        uid,
+                        gid,
+                        read_enabled,
+                        write_enabled,
+                        pending_opts,
+                    );
                 }
                 Handle::File(ref mut file) => file,
             };
@@ -909,7 +949,15 @@ where
 
         let file = match *file {
             Handle::File(ref mut f) => f,
-            _ => return Err(SyscallError::new(syscall::EBADF)),
+            // Not bound/connected yet. Still report the scheme, so clients can tell what kind of
+            // socket this is (relibc needs it to route IPPROTO_TCP options).
+            Handle::Null(_) => {
+                let path = format!("/scheme/{}/", self.scheme_name);
+                let len = path.len().min(buf.len());
+                buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+                return Ok(len);
+            }
+            Handle::SchemeRoot => return Err(SyscallError::new(syscall::EBADF)),
         };
 
         let socket_set = self.socket_set.borrow();
