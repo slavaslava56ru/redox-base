@@ -29,6 +29,7 @@ use crate::Smolnetd;
 
 const SO_RCVBUF: usize = 8;
 const SO_SNDBUF: usize = 7;
+pub const SOL_SOCKET: usize = 1;
 
 pub struct Context {
     pub iface: Interface,
@@ -254,6 +255,18 @@ where
         // Return Err for default implementation
         Err(SyscallError::new(syscall::ENOPROTOOPT))
     }
+
+    /// Applies a `setsockopt` option. Options a socket type does not handle are accepted and
+    /// ignored, which keeps the old behaviour where every option silently succeeded.
+    fn set_sock_opt(
+        &mut self,
+        _file: &mut SchemeFile<Self>,
+        _level: usize,
+        _name: usize,
+        _buf: &[u8],
+    ) -> SyscallResult<usize> {
+        Ok(0)
+    }
 }
 
 pub enum Handle<SocketT>
@@ -451,10 +464,20 @@ where
             // SocketCall::Bind => self.handle_bind(id, &payload),
             // SocketCall::Connect => self.handle_connect(id, &payload),
             SocketCall::SetSockOpt => {
-                // currently not used
-                // self.handle_setsockopt(id, metadata[1] as i32, &payload)
-                // TODO: SO_REUSEADDR from null socket
-                Ok(0)
+                // metadata: [verb, option_name, level]; older relibc sends no level, which
+                // always meant SOL_SOCKET.
+                let name = metadata[1] as usize;
+                let level = metadata.get(2).map_or(SOL_SOCKET, |&level| level as usize);
+                match self.handles.get_mut(fd)? {
+                    Handle::File(file) => {
+                        let mut socket_set = self.socket_set.borrow_mut();
+                        let socket = socket_set.get_mut::<SocketT>(file.socket_handle());
+                        SocketT::set_sock_opt(socket, file, level, name, payload)
+                    }
+                    // TODO: remember options (e.g. SO_REUSEADDR) set before bind/connect
+                    Handle::Null(_) => Ok(0),
+                    Handle::SchemeRoot => Err(SyscallError::new(syscall::EBADF)),
+                }
             }
             SocketCall::GetSockOpt => {
                 let handle = self.handles.get_mut(fd)?;

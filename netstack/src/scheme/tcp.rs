@@ -3,16 +3,27 @@ use std::str;
 use libredox::flag;
 use scheme_utils::FpathWriter;
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State};
+use smoltcp::time::Duration;
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 use syscall::{self, Error as SyscallError, Result as SyscallResult};
 
-use super::socket::{Context, DupResult, SchemeFile, SchemeSocket, SocketFile};
+use super::socket::{Context, DupResult, SchemeFile, SchemeSocket, SocketFile, SOL_SOCKET};
 use super::{parse_endpoint, SchemeWrapper, SocketSet};
 use crate::port_set::PortSet;
 
 const SO_SNDBUF: usize = 7;
 const SO_RCVBUF: usize = 8;
+const SO_KEEPALIVE: usize = 9;
+
+const IPPROTO_TCP: usize = 6;
+const TCP_NODELAY: usize = 1;
+const TCP_KEEPIDLE: usize = 4;
+const TCP_KEEPINTVL: usize = 5;
+const TCP_KEEPCNT: usize = 6;
+
+/// Linux's default `tcp_keepalive_time`.
+const DEFAULT_KEEPIDLE: Duration = Duration::from_secs(7200);
 
 pub type TcpScheme = SchemeWrapper<TcpSocket<'static>>;
 
@@ -426,5 +437,57 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
             }
             _ => Err(SyscallError::new(syscall::ENOPROTOOPT)),
         }
+    }
+
+    fn set_sock_opt(
+        &mut self,
+        _file: &mut SchemeFile<Self>,
+        level: usize,
+        name: usize,
+        buf: &[u8],
+    ) -> SyscallResult<usize> {
+        let int_value = || -> SyscallResult<i32> {
+            let bytes = buf
+                .get(..4)
+                .ok_or_else(|| SyscallError::new(syscall::EINVAL))?;
+            Ok(i32::from_ne_bytes(bytes.try_into().unwrap()))
+        };
+
+        // smoltcp arms the keep-alive timer as soon as it is enabled, so on a connection that is
+        // still handshaking (e.g. curl sets SO_KEEPALIVE right after a non-blocking connect) it
+        // would send a keep-alive probe instead of completing the handshake. Until such options
+        // can be remembered and applied once established, ignore them before that point.
+        let established = matches!(self.state(), State::Established | State::CloseWait);
+
+        match (level, name) {
+            (SOL_SOCKET | IPPROTO_TCP, SO_KEEPALIVE | TCP_KEEPIDLE) if !established => {}
+            (SOL_SOCKET, SO_KEEPALIVE) => {
+                let keep_alive = if int_value()? != 0 {
+                    Some(self.keep_alive().unwrap_or(DEFAULT_KEEPIDLE))
+                } else {
+                    None
+                };
+                self.set_keep_alive(keep_alive);
+            }
+            (IPPROTO_TCP, TCP_NODELAY) => self.set_nagle_enabled(int_value()? == 0),
+            (IPPROTO_TCP, TCP_KEEPIDLE) => {
+                let secs = u64::try_from(int_value()?)
+                    .ok()
+                    .filter(|&secs| secs > 0)
+                    .ok_or_else(|| SyscallError::new(syscall::EINVAL))?;
+                // Like Linux, the idle time is kept but only acts while SO_KEEPALIVE is on.
+                // smoltcp has no separate storage for it, so it only applies when enabled.
+                if self.keep_alive().is_some() {
+                    self.set_keep_alive(Some(Duration::from_secs(secs)));
+                }
+            }
+            // smoltcp uses one interval for both the idle time and the probe interval, and has
+            // no probe count, so these are accepted without effect.
+            (IPPROTO_TCP, TCP_KEEPINTVL | TCP_KEEPCNT) => {
+                int_value()?;
+            }
+            _ => {}
+        }
+        Ok(0)
     }
 }
